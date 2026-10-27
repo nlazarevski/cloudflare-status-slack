@@ -1,0 +1,54 @@
+name: Cloudflare status to Slack
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 min (GitHub may start runs a few minutes late)
+  workflow_dispatch:         # "Run workflow" button for manual runs
+
+permissions:
+  contents: read
+  actions: write             # lets the keep-alive step re-enable this workflow
+
+concurrency:
+  group: cloudflare-status
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      # The state file lives in the Actions cache, not the repo. Each run restores the
+      # newest one and saves a new copy; caches unused for 7 days are dropped by GitHub,
+      # after which the script just takes a fresh baseline.
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: cloudflare-status-state.json
+          key: cf-state-${{ github.run_id }}
+          restore-keys: cf-state-
+
+      - name: Poll Cloudflare and post changes
+        shell: pwsh
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: ./cloudflare-status-to-slack.ps1
+
+      - name: Save state
+        uses: actions/cache/save@v4
+        with:
+          path: cloudflare-status-state.json
+          key: cf-state-${{ github.run_id }}
+
+      # GitHub pauses schedules in public repos after 60 days without commits.
+      # Re-enabling the workflow during the 00:00 UTC hour each day resets that timer.
+      - name: Keep schedule alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%H)" = "00" ]; then
+            gh workflow enable cloudflare-status.yml --repo "$GITHUB_REPOSITORY"
+          fi
