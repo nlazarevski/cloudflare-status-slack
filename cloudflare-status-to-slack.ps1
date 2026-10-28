@@ -10,6 +10,11 @@
     - optionally, scheduled maintenance gets a new update (-IncludeMaintenance)
     - optionally, a watched component changes status (-Components "Dashboard","DNS*")
 
+  Like the status page's own subscription options, incident posts can be limited to the
+  components or groups you care about (-Categories) and to a minimum impact (-MinImpact).
+  Each of these can also come from an environment variable (CF_CATEGORIES, CF_MIN_IMPACT,
+  CF_SKIP_UNTAGGED, CF_SKIP_OVERALL_STATUS), which is how the GitHub workflow passes them.
+
   The first run only records the current state and posts nothing, so you don't get flooded
   with the last 50 incidents.
 
@@ -19,11 +24,22 @@
 
 .EXAMPLE
   .\cloudflare-status-to-slack.ps1 -Components 'Dashboard','API','*Workers*' -DryRun
+
+.EXAMPLE
+  # Only incidents touching these services or the North America region, minor impact or worse
+  .\cloudflare-status-to-slack.ps1 -Categories 'DNS*','Dashboard','North America' -MinImpact minor
 #>
 param(
     [string]   $WebhookUrl = $env:SLACK_WEBHOOK_URL,
     [string]   $StatusPage = 'https://www.cloudflarestatus.com',
     [string[]] $Components = @(),           # wildcard names to watch; empty = none (Cloudflare lists ~480)
+    # Wildcard component or group names; an incident is posted if it affects any of them.
+    # Empty = all incidents. Env var form is separated by ';' or new lines (names contain commas).
+    [string[]] $Categories = @(($env:CF_CATEGORIES -split '[;\r\n]') | ForEach-Object { $_.Trim() } | Where-Object { $_ }),
+    [ValidateSet('none', 'minor', 'major', 'critical')]
+    [string]   $MinImpact = $(if ($env:CF_MIN_IMPACT) { $env:CF_MIN_IMPACT } else { 'none' }),
+    [switch]   $SkipUntagged = ($env:CF_SKIP_UNTAGGED -eq 'true'),            # with -Categories: drop incidents that list no components
+    [switch]   $SkipOverallStatus = ($env:CF_SKIP_OVERALL_STATUS -eq 'true'), # don't post overall status changes
     [switch]   $IncludeMaintenance,
     [string]   $StateFile  = (Join-Path $PSScriptRoot 'cloudflare-status-state.json'),
     [switch]   $DryRun                      # print messages instead of posting
@@ -83,11 +99,27 @@ if ($IncludeMaintenance) {
         ForEach-Object { $_ | Add-Member -NotePropertyName kind -NotePropertyValue 'Maintenance' -PassThru })
 }
 
+$groupNames = @{}
+$summary.components | Where-Object group | ForEach-Object { $groupNames[$_.id] = $_.name }
+$impactRank = @{ none = 0; minor = 1; major = 2; critical = 3 }
+
+function Test-Wanted($item) {
+    if ($item.kind -eq 'Incident' -and $impactRank[[string]$item.impact] -lt $impactRank[$MinImpact]) { return $false }
+    if (-not $Categories.Count) { return $true }
+    if (-not $item.components) { return -not $SkipUntagged }
+    foreach ($c in $item.components) {
+        foreach ($name in @($c.name, $groupNames[$c.group_id])) {
+            if ($name -and ($Categories | Where-Object { $name -like $_ })) { return $true }
+        }
+    }
+    $false
+}
+
 $messages = New-Object System.Collections.Generic.List[string]
 
 # ---- overall status ----
 $indicator = $summary.status.indicator
-if (-not $firstRun -and $state.indicator -and $indicator -ne $state.indicator) {
+if (-not $firstRun -and -not $SkipOverallStatus -and $state.indicator -and $indicator -ne $state.indicator) {
     $messages.Add("$(Get-StatusEmoji $indicator) *Cloudflare status: $($summary.status.description)*  (<$StatusPage|status page>)")
 }
 
@@ -99,12 +131,15 @@ $newUpdates = foreach ($item in $items) {
 }
 foreach ($n in ($newUpdates | Sort-Object { [datetime]$_.update.created_at })) {
     [void]$seen.Add($n.update.id)
-    if ($firstRun) { continue }
+    # filtered-out updates still count as seen, so changing the filter later doesn't replay them
+    if ($firstRun -or -not (Test-Wanted $n.item)) { continue }
     $i = $n.item; $u = $n.update
     $status = (Get-Culture).TextInfo.ToTitleCase(($u.status -replace '_', ' '))
+    $affects = @($i.components.name)
+    $affectsText = if ($affects.Count -gt 5) { ($affects[0..4] -join ', ') + " +$($affects.Count - 5) more" } else { $affects -join ', ' }
     $messages.Add(
         "$(Get-StatusEmoji $u.status) *$($n.item.kind) $($status):* <$($i.shortlink)|$(Format-Body $i.name)>`n" +
-        "Impact: $($i.impact)`n" +
+        "Impact: $($i.impact)$(if ($affectsText) { "  |  Affects: $(Format-Body $affectsText)" })`n" +
         "> $((Format-Body $u.body) -replace "`n", "`n> ")")
 }
 
