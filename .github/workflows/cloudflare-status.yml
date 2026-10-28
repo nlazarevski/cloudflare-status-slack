@@ -34,6 +34,11 @@ jobs:
         shell: pwsh
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Filters, set under Settings -> Secrets and variables -> Actions -> Variables (all optional)
+          CF_CATEGORIES: ${{ vars.CF_CATEGORIES }}
+          CF_MIN_IMPACT: ${{ vars.CF_MIN_IMPACT }}
+          CF_SKIP_UNTAGGED: ${{ vars.CF_SKIP_UNTAGGED }}
+          CF_SKIP_OVERALL_STATUS: ${{ vars.CF_SKIP_OVERALL_STATUS }}
         run: ./cloudflare-status-to-slack.ps1
 
       - name: Save state
