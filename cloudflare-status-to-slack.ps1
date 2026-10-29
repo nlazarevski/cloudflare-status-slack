@@ -41,8 +41,11 @@ param(
     [switch]   $SkipUntagged = ($env:CF_SKIP_UNTAGGED -eq 'true'),            # with -Categories: drop incidents that list no components
     [switch]   $SkipOverallStatus = ($env:CF_SKIP_OVERALL_STATUS -eq 'true'), # don't post overall status changes
     [switch]   $IncludeMaintenance,
+    # Small header on every post, so it stands apart from other alerts in a shared channel
+    [string]   $Label = $(if ($env:CF_SLACK_LABEL) { $env:CF_SLACK_LABEL } else { ':cloud: *Cloudflare Status*' }),
     [string]   $StateFile  = (Join-Path $PSScriptRoot 'cloudflare-status-state.json'),
-    [switch]   $DryRun                      # print messages instead of posting
+    [switch]   $DryRun,                     # print messages instead of posting
+    [switch]   $TestPost                    # also post the latest update of the newest incident, to preview the format
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,9 +68,31 @@ function Get-StatusEmoji($value) {
     }
 }
 
-function Send-Slack($text) {
-    if ($DryRun) { Write-Host "---- would post ----`n$text`n"; return }
-    $json  = @{ text = $text; unfurl_links = $false } | ConvertTo-Json -Compress
+function Get-StatusColor($value) {
+    switch ($value) {
+        { $_ -in 'none', 'operational', 'resolved', 'completed' }        { '#2EB67D'; break }   # green
+        { $_ -in 'minor', 'degraded_performance', 'monitoring' }         { '#ECB22E'; break }   # yellow
+        { $_ -in 'major', 'partial_outage', 'identified' }               { '#F38020'; break }   # orange
+        { $_ -in 'critical', 'major_outage', 'investigating' }           { '#E01E5A'; break }   # red
+        { $_ -in 'scheduled', 'in_progress', 'verifying', 'under_maintenance' } { '#1D9BD1'; break }   # blue
+        default                                                          { '#A0A0A0' }
+    }
+}
+
+# Posts as an attachment: colored bar on the left (by status), label header, then the message
+function Send-Slack($text, $status) {
+    if ($DryRun) { Write-Host "---- would post ($(Get-StatusColor $status)) ----`n$Label`n$text`n"; return }
+    $json = @{
+        unfurl_links = $false
+        attachments  = @(@{
+            color    = Get-StatusColor $status
+            fallback = ($text -replace '[*>]', '')
+            blocks   = @(
+                @{ type = 'context'; elements = @(@{ type = 'mrkdwn'; text = $Label }) },
+                @{ type = 'section'; text = @{ type = 'mrkdwn'; text = $text } }
+            )
+        })
+    } | ConvertTo-Json -Depth 8 -Compress
     $bytes = [Text.Encoding]::UTF8.GetBytes($json)   # PS 5.1 otherwise mangles non-ASCII
     Invoke-RestMethod -Uri $WebhookUrl -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes | Out-Null
 }
@@ -115,12 +140,12 @@ function Test-Wanted($item) {
     $false
 }
 
-$messages = New-Object System.Collections.Generic.List[string]
+$messages = New-Object System.Collections.Generic.List[object]   # @{ text; status }
 
 # ---- overall status ----
 $indicator = $summary.status.indicator
 if (-not $firstRun -and -not $SkipOverallStatus -and $state.indicator -and $indicator -ne $state.indicator) {
-    $messages.Add("$(Get-StatusEmoji $indicator) *Cloudflare status: $($summary.status.description)*  (<$StatusPage|status page>)")
+    $messages.Add(@{ status = $indicator; text = "$(Get-StatusEmoji $indicator) *Cloudflare status: $($summary.status.description)*  (<$StatusPage|status page>)" })
 }
 
 # ---- incident / maintenance updates (oldest first so Slack reads in order) ----
@@ -129,18 +154,22 @@ $newUpdates = foreach ($item in $items) {
         if (-not $seen.Contains($u.id)) { [pscustomobject]@{ item = $item; update = $u } }
     }
 }
+if ($TestPost) {
+    $latest = $items | Where-Object { $_.kind -eq 'Incident' } | Select-Object -First 1
+    $newUpdates = @([pscustomobject]@{ item = $latest; update = $latest.incident_updates[0]; test = $true }) + @($newUpdates)
+}
 foreach ($n in ($newUpdates | Sort-Object { [datetime]$_.update.created_at })) {
     [void]$seen.Add($n.update.id)
     # filtered-out updates still count as seen, so changing the filter later doesn't replay them
-    if ($firstRun -or -not (Test-Wanted $n.item)) { continue }
+    if (-not $n.test -and ($firstRun -or -not (Test-Wanted $n.item))) { continue }
     $i = $n.item; $u = $n.update
     $status = (Get-Culture).TextInfo.ToTitleCase(($u.status -replace '_', ' '))
     $affects = @($i.components.name)
     $affectsText = if ($affects.Count -gt 5) { ($affects[0..4] -join ', ') + " +$($affects.Count - 5) more" } else { $affects -join ', ' }
-    $messages.Add(
+    $messages.Add(@{ status = $u.status; text =
         "$(Get-StatusEmoji $u.status) *$($n.item.kind) $($status):* <$($i.shortlink)|$(Format-Body $i.name)>`n" +
         "Impact: $($i.impact)$(if ($affectsText) { "  |  Affects: $(Format-Body $affectsText)" })`n" +
-        "> $((Format-Body $u.body) -replace "`n", "`n> ")")
+        "> $((Format-Body $u.body) -replace "`n", "`n> ")" })
 }
 
 # ---- watched components ----
@@ -151,13 +180,13 @@ if ($Components.Count) {
         $watched[$c.id] = $c.status
         $old = $state.components[$c.id]
         if (-not $firstRun -and $old -and $old -ne $c.status) {
-            $messages.Add("$(Get-StatusEmoji $c.status) *Component $($c.name):* $($old -replace '_',' ') -> $($c.status -replace '_',' ')")
+            $messages.Add(@{ status = $c.status; text = "$(Get-StatusEmoji $c.status) *Component $($c.name):* $($old -replace '_',' ') -> $($c.status -replace '_',' ')" })
         }
     }
 }
 
 # ---- send + save ----
-foreach ($m in $messages) { Send-Slack $m }
+foreach ($m in $messages) { Send-Slack $m.text $m.status }
 
 # keep only ids still present in the feeds so the state file doesn't grow forever
 $liveIds = @($items | ForEach-Object { $_.incident_updates.id })
