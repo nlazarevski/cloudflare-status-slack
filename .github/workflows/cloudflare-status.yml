@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '*/5 * * * *'   # every 5 min (GitHub may start runs a few minutes late)
   workflow_dispatch:         # "Run workflow" button for manual runs
+    inputs:
+      test_post:
+        description: 'Also post the latest Cloudflare incident update, to preview the format'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -39,7 +44,8 @@ jobs:
           CF_MIN_IMPACT: ${{ vars.CF_MIN_IMPACT }}
           CF_SKIP_UNTAGGED: ${{ vars.CF_SKIP_UNTAGGED }}
           CF_SKIP_OVERALL_STATUS: ${{ vars.CF_SKIP_OVERALL_STATUS }}
-        run: ./cloudflare-status-to-slack.ps1
+          CF_SLACK_LABEL: ${{ vars.CF_SLACK_LABEL }}
+        run: ./cloudflare-status-to-slack.ps1 ${{ inputs.test_post && '-TestPost' || '' }}
 
       - name: Save state
         uses: actions/cache/save@v4
